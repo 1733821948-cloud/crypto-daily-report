@@ -1,0 +1,541 @@
+#!/usr/bin/env python3
+"""
+币圈日报自动生成器 v2.0 (极简版)
+只需: DeepSeek API Key + QQ邮箱授权码，其他全部免费
+
+使用方法:
+  1. py -m pip install requests pyyaml feedparser
+  2. 编辑 config.yaml 填入 DeepSeek Key 和 QQ 邮箱授权码
+  3. py crypto_daily.py
+"""
+
+import yaml
+import requests
+import feedparser
+import smtplib
+import json
+import logging
+import time
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+# ============================================================
+#  日志配置
+# ============================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# ============================================================
+#  加载配置
+# ============================================================
+CONFIG_PATH = Path(__file__).parent / "config.yaml"
+
+
+def load_config() -> dict:
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+# ============================================================
+#  模块 1: 市场数据 (CoinGecko 免费，无需 Key)
+# ============================================================
+class MarketDataCollector:
+    BASE_URL = "https://api.coingecko.com/api/v3"
+
+    def __init__(self, coins: list[str], top_n: int = 5):
+        self.coins = coins
+        self.top_n = top_n
+
+    def fetch_prices(self) -> list[dict]:
+        logger.info("📊 正在获取市场数据...")
+        url = f"{self.BASE_URL}/coins/markets"
+        params = {
+            "vs_currency": "usd",
+            "ids": ",".join(self.coins),
+            "order": "market_cap_desc",
+            "per_page": 50,
+            "page": 1,
+            "sparkline": "false",
+            "price_change_percentage": "1h,24h,7d",
+        }
+        try:
+            resp = requests.get(url, params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            logger.info(f"  ✅ 获取到 {len(data)} 个币种")
+            return data
+        except Exception as e:
+            logger.error(f"  ❌ 市场数据失败: {e}")
+            return []
+
+    def fetch_global(self) -> dict:
+        try:
+            resp = requests.get(f"{self.BASE_URL}/global", timeout=30)
+            resp.raise_for_status()
+            return resp.json().get("data", {})
+        except Exception as e:
+            logger.error(f"  ❌ 全球数据失败: {e}")
+            return {}
+
+    def fetch_fear_greed(self) -> dict:
+        try:
+            resp = requests.get("https://api.alternative.me/fng/?limit=1", timeout=15)
+            resp.raise_for_status()
+            d = resp.json().get("data", [{}])[0]
+            return {"value": d.get("value", "N/A"), "label": d.get("value_classification", "N/A")}
+        except Exception as e:
+            logger.error(f"  ❌ 恐惧贪婪指数失败: {e}")
+            return {"value": "N/A", "label": "N/A"}
+
+    def collect(self) -> dict:
+        coins = self.fetch_prices()
+        sorted_coins = sorted(coins, key=lambda x: x.get("price_change_percentage_24h") or 0, reverse=True)
+        return {
+            "coins": coins,
+            "global": self.fetch_global(),
+            "fear_greed": self.fetch_fear_greed(),
+            "top_gainers": sorted_coins[: self.top_n],
+            "top_losers": sorted_coins[-self.top_n :][::-1],
+        }
+
+    def format_for_ai(self, data: dict) -> str:
+        lines = ["## 市场数据\n"]
+        g = data.get("global", {})
+        total_mc = g.get("total_market_cap", {}).get("usd", 0)
+        total_vol = g.get("total_volume", {}).get("usd", 0)
+        btc_dom = g.get("market_cap_percentage", {}).get("btc", 0)
+        fng = data.get("fear_greed", {})
+        lines.append(f"总市值: ${total_mc / 1e12:.2f}T | 24h交易量: ${total_vol / 1e9:.1f}B")
+        lines.append(f"BTC市占率: {btc_dom:.1f}% | 恐惧贪婪指数: {fng['value']} ({fng['label']})\n")
+
+        lines.append("### 各币种详情")
+        for c in data["coins"]:
+            sym = c.get("symbol", "").upper()
+            price = c.get("current_price", 0)
+            h1 = c.get("price_change_percentage_1h_in_currency") or 0
+            h24 = c.get("price_change_percentage_24h") or 0
+            d7 = c.get("price_change_percentage_7d_in_currency") or 0
+            mc = c.get("market_cap", 0)
+            lines.append(
+                f"- {c.get('name','')}({sym}): ${price:,.2f} | "
+                f"1h:{h1:+.2f}% 24h:{h24:+.2f}% 7d:{d7:+.2f}% | 市值:${mc / 1e9:.1f}B"
+            )
+
+        lines.append("\n### 24h涨幅榜")
+        for c in data["top_gainers"]:
+            lines.append(f"  🟢 {c['symbol'].upper()}: {(c.get('price_change_percentage_24h') or 0):+.2f}%")
+        lines.append("\n### 24h跌幅榜")
+        for c in data["top_losers"]:
+            lines.append(f"  🔴 {c['symbol'].upper()}: {(c.get('price_change_percentage_24h') or 0):+.2f}%")
+        return "\n".join(lines)
+
+
+# ============================================================
+#  模块 2: 新闻 (纯 RSS，完全免费)
+# ============================================================
+class NewsCollector:
+    def __init__(self, feeds: list[dict], max_news: int = 30):
+        self.feeds = feeds
+        self.max_news = max_news
+
+    def collect(self) -> list[dict]:
+        logger.info("📰 正在获取 RSS 新闻...")
+        all_news = []
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=36)
+
+        for feed_cfg in self.feeds:
+            name = feed_cfg["name"]
+            url = feed_cfg["url"]
+            try:
+                feed = feedparser.parse(url)
+                count = 0
+                for entry in feed.entries[:15]:
+                    # 过滤旧新闻
+                    pub = entry.get("published_parsed")
+                    if pub:
+                        pub_dt = datetime(*pub[:6], tzinfo=timezone.utc)
+                        if pub_dt < cutoff:
+                            continue
+
+                    # 清理摘要中的 HTML 标签
+                    summary = entry.get("summary", "")
+                    import re
+                    summary = re.sub(r"<[^>]+>", "", summary)[:200]
+
+                    all_news.append({
+                        "title": entry.get("title", ""),
+                        "source": name,
+                        "url": entry.get("link", ""),
+                        "published": entry.get("published", ""),
+                        "summary": summary,
+                    })
+                    count += 1
+                logger.info(f"  ✅ {name}: {count} 条")
+            except Exception as e:
+                logger.warning(f"  ⚠️ {name} 失败: {e}")
+
+        # 去重
+        seen = set()
+        unique = []
+        for item in all_news:
+            key = item["title"][:30].lower()
+            if key not in seen:
+                seen.add(key)
+                unique.append(item)
+
+        logger.info(f"📰 去重后共 {len(unique)} 条新闻")
+        return unique[: self.max_news]
+
+    def format_for_ai(self, news: list[dict]) -> str:
+        lines = ["## 行业新闻\n"]
+        for i, item in enumerate(news, 1):
+            lines.append(f"{i}. [{item['source']}] {item['title']}")
+            if item.get("summary"):
+                lines.append(f"   摘要: {item['summary'][:150]}")
+        return "\n".join(lines)
+
+
+# ============================================================
+#  模块 3: Reddit 社交热点 (公开 JSON 接口，免费无需注册)
+# ============================================================
+class SocialCollector:
+    """直接用 Reddit 的公开 .json 接口，不需要注册 App"""
+
+    HEADERS = {"User-Agent": "CryptoDailyBot/2.0"}
+
+    def __init__(self, subreddits: list[str], max_posts: int = 10):
+        self.subreddits = subreddits
+        self.max_posts = max_posts
+
+    def fetch_hot(self, subreddit: str) -> list[dict]:
+        url = f"https://www.reddit.com/r/{subreddit}/hot.json"
+        params = {"limit": self.max_posts, "t": "day"}
+        for attempt in range(1, 3):  # 最多重试 2 次
+            try:
+                resp = requests.get(url, headers=self.HEADERS, params=params, timeout=15)
+                resp.raise_for_status()
+                posts = []
+                for child in resp.json().get("data", {}).get("children", []):
+                    p = child.get("data", {})
+                    if p.get("stickied"):
+                        continue
+                    posts.append({
+                        "title": p.get("title", ""),
+                        "subreddit": subreddit,
+                        "score": p.get("score", 0),
+                        "num_comments": p.get("num_comments", 0),
+                        "upvote_ratio": p.get("upvote_ratio", 0),
+                        "selftext": (p.get("selftext") or "")[:300],
+                    })
+                return posts
+            except Exception as e:
+                if attempt < 2:
+                    logger.info(f"  ⏳ r/{subreddit} 失败，5秒后重试...")
+                    time.sleep(5)
+                else:
+                    logger.warning(f"  ⚠️ r/{subreddit} 最终失败: {e}")
+        return []
+
+    def collect(self) -> list[dict]:
+        logger.info("💬 正在获取 Reddit 热点...")
+        all_posts = []
+        for sub in self.subreddits:
+            posts = self.fetch_hot(sub)
+            all_posts.extend(posts)
+            logger.info(f"  📌 r/{sub}: {len(posts)} 条")
+            time.sleep(2)  # 公开接口限速，间隔 2 秒
+
+        all_posts.sort(key=lambda x: x.get("score", 0), reverse=True)
+        return all_posts
+
+    def format_for_ai(self, posts: list[dict]) -> str:
+        lines = ["## Reddit 社交热点\n"]
+        for i, p in enumerate(posts[:20], 1):
+            lines.append(
+                f"{i}. [r/{p['subreddit']}] {p['title']}\n"
+                f"   🔺{p['score']}票 💬{p['num_comments']}评论 好评率{p['upvote_ratio']:.0%}"
+            )
+            if p.get("selftext"):
+                lines.append(f"   预览: {p['selftext'][:120]}...")
+        return "\n".join(lines)
+
+
+# ============================================================
+#  模块 4: DeepSeek AI 汇总
+# ============================================================
+class AIAnalyzer:
+    FALLBACK_MODEL = "deepseek-chat"
+
+    def __init__(self, api_key: str, model: str, base_url: str):
+        self.api_key = api_key
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+
+    def _build_prompt(self, market_text: str, news_text: str, social_text: str):
+        today = datetime.now(tz=timezone(timedelta(hours=8))).strftime("%Y年%m月%d日")
+
+        system_prompt = f"""你是一位资深加密货币分析师，撰写中文币圈日报。今天是{today}。
+
+要求：全中文，专有名词保留英文，不编造数据，解读新闻影响，分析社区情绪。
+
+按以下 HTML 结构输出（不要 markdown 代码块标记）：
+<h2>📊 一、市场总览</h2>（用表格展示主要币种）
+<h2>📈 二、涨跌幅排行</h2>（涨幅榜跌幅榜，分析异动）
+<h2>📰 三、今日重大新闻</h2>（最重要的5-8条，逐条解读）
+<h2>💬 四、社交媒体热点</h2>（Reddit焦点和情绪）
+<h2>🔮 五、AI 分析师观点</h2>（趋势判断、信号、风险）
+<h2>🎯 六、今日总评</h2>
+这个板块要求：
+- 市场情绪评分：给出 1-10 分（1=极度恐慌 5=中性 10=极度贪婪），用大号加粗显示
+- 方向判断：明确写出"偏多"/"中性"/"偏空"
+- 🟢 最大机会：一句话点明今天最值得关注的机会
+- 🔴 最大风险：一句话点明今天最需要警惕的风险
+- 用醒目的样式展示，让读者一眼就能看到结论
+
+表格用 style="border-collapse:collapse;" 并给 td/th 加边框。"""
+
+        # 新闻保留20条，Reddit保留12条
+        news_lines = [l for l in news_text.split("\n") if l.strip()]
+        compressed_news = "\n".join(news_lines[:28])
+
+        social_lines = [l for l in social_text.split("\n") if l.strip()]
+        compressed_social = "\n".join(social_lines[:18])
+
+        user_content = f"""{market_text}
+
+{compressed_news}
+
+{compressed_social}"""
+
+        return system_prompt, user_content
+
+    def _call_api_stream(self, model: str, system_prompt: str, user_content: str,
+                         timeout: int = 300, max_retries: int = 2) -> str | None:
+        """流式调用 DeepSeek API，避免长时间等待导致连接断开"""
+        url = f"{self.base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            "max_tokens": 8000,
+            "stream": True,
+        }
+        if model != "deepseek-reasoner":
+            payload["temperature"] = 0.7
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                logger.info(f"  📡 第 {attempt} 次调用 {model}（流式模式）...")
+                resp = requests.post(url, headers=headers, json=payload,
+                                     timeout=(30, timeout), stream=True)
+                resp.raise_for_status()
+
+                content_parts = []
+                reasoning_len = 0
+
+                for line in resp.iter_lines(decode_unicode=True):
+                    if not line or not line.startswith("data: "):
+                        continue
+                    data_str = line[6:]  # 去掉 "data: " 前缀
+                    if data_str.strip() == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        # 收集正文内容
+                        if delta.get("content"):
+                            content_parts.append(delta["content"])
+                        # 统计推理长度（不保存）
+                        if delta.get("reasoning_content"):
+                            reasoning_len += len(delta["reasoning_content"])
+                    except json.JSONDecodeError:
+                        continue
+
+                content = "".join(content_parts)
+                if reasoning_len:
+                    logger.info(f"  💭 推理过程: {reasoning_len} 字符")
+                if content:
+                    logger.info(f"  ✅ {model} 生成成功: {len(content)} 字符")
+                    return content
+                else:
+                    logger.warning(f"  ⚠️ {model} 返回了空内容")
+
+            except Exception as e:
+                logger.warning(f"  ⚠️ 第 {attempt} 次调用 {model} 失败: {e}")
+                if attempt < max_retries:
+                    wait = 10 * attempt
+                    logger.info(f"  ⏳ 等待 {wait} 秒后重试...")
+                    time.sleep(wait)
+        return None
+
+    def generate_report(self, market_text: str, news_text: str, social_text: str) -> str:
+        logger.info("🤖 正在生成 AI 日报...")
+        system_prompt, user_content = self._build_prompt(market_text, news_text, social_text)
+
+        # 第一优先：reasoner
+        result = self._call_api_stream(self.model, system_prompt, user_content,
+                                       timeout=300, max_retries=2)
+        if result:
+            return result
+
+        # 降级：deepseek-chat
+        if self.model != self.FALLBACK_MODEL:
+            logger.info(f"  🔄 降级到 {self.FALLBACK_MODEL}...")
+            result = self._call_api_stream(self.FALLBACK_MODEL, system_prompt, user_content,
+                                           timeout=120, max_retries=2)
+            if result:
+                return f'<p style="color:#e67e22;"><strong>⚠️ 本期由 {self.FALLBACK_MODEL} 生成</strong></p>\n{result}'
+
+        # 全部失败
+        logger.error("  ❌ 所有模型均失败，发送原始数据")
+        return f"""<h2>⚠️ AI 汇总暂时不可用</h2>
+<p>DeepSeek API 调用失败，以下为原始数据：</p>
+<h3>市场数据</h3><pre style="white-space:pre-wrap;font-size:13px;">{market_text}</pre>
+<h3>新闻</h3><pre style="white-space:pre-wrap;font-size:13px;">{news_text}</pre>
+<h3>Reddit</h3><pre style="white-space:pre-wrap;font-size:13px;">{social_text}</pre>"""
+
+
+# ============================================================
+#  模块 5: 邮件发送 (QQ邮箱)
+# ============================================================
+class EmailSender:
+    def __init__(self, smtp_server: str, smtp_port: int,
+                 sender: str, password: str, receivers: list[str]):
+        self.smtp_server = smtp_server
+        self.smtp_port = smtp_port
+        self.sender = sender
+        self.password = password
+        self.receivers = receivers
+
+    def send(self, subject: str, html_body: str):
+        logger.info("📧 正在发送邮件...")
+
+        full_html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+body {{
+  font-family: -apple-system, "Microsoft YaHei", sans-serif;
+  line-height: 1.8; color: #333;
+  max-width: 800px; margin: 0 auto; padding: 20px;
+  background: #f5f5f5;
+}}
+.container {{
+  background: #fff; border-radius: 12px;
+  padding: 30px; box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+}}
+.header {{
+  text-align: center; padding: 20px 0;
+  border-bottom: 2px solid #f0f0f0; margin-bottom: 24px;
+}}
+.header h1 {{ font-size: 26px; color: #1a1a2e; margin: 0; }}
+.header .date {{ color: #888; font-size: 14px; margin-top: 6px; }}
+h2 {{
+  color: #16213e; border-left: 4px solid #e94560;
+  padding-left: 12px; margin-top: 30px;
+}}
+table {{
+  border-collapse: collapse; width: 100%; margin: 12px 0;
+}}
+th, td {{
+  border: 1px solid #ddd; padding: 8px 12px;
+  text-align: left; font-size: 14px;
+}}
+th {{ background: #16213e; color: white; }}
+tr:nth-child(even) {{ background: #f9f9f9; }}
+.footer {{
+  text-align: center; padding: 20px 0; margin-top: 30px;
+  border-top: 1px solid #eee; font-size: 12px; color: #aaa;
+}}
+ul {{ padding-left: 20px; }}
+li {{ margin-bottom: 6px; }}
+</style></head>
+<body><div class="container">
+  <div class="header">
+    <h1>🪙 币圈日报</h1>
+    <div class="date">{subject}</div>
+  </div>
+  {html_body}
+  <div class="footer">
+    由 CryptoDailyBot 自动生成 | Powered by DeepSeek AI<br>
+    ⚠️ 本报告仅供参考，不构成任何投资建议
+  </div>
+</div></body></html>"""
+
+        msg = MIMEMultipart("alternative")
+        msg["From"] = self.sender
+        msg["To"] = ", ".join(self.receivers)
+        msg["Subject"] = subject
+        msg.attach(MIMEText(full_html, "html", "utf-8"))
+
+        try:
+            with smtplib.SMTP_SSL(self.smtp_server, self.smtp_port) as server:
+                server.login(self.sender, self.password)
+                server.sendmail(self.sender, self.receivers, msg.as_string())
+            logger.info(f"  ✅ 邮件已发送 → {', '.join(self.receivers)}")
+        except Exception as e:
+            logger.error(f"  ❌ 邮件发送失败: {e}")
+
+
+# ============================================================
+#  主流程
+# ============================================================
+def main():
+    start = time.time()
+    now = datetime.now(tz=timezone(timedelta(hours=8)))
+    logger.info("=" * 55)
+    logger.info(f"🚀 币圈日报开始 - {now.strftime('%Y-%m-%d %H:%M:%S')} CST")
+    logger.info("=" * 55)
+
+    cfg = load_config()
+
+    # 1. 市场数据
+    market = MarketDataCollector(cfg["tracking"]["coins"], cfg["tracking"]["top_n"])
+    market_data = market.collect()
+    market_text = market.format_for_ai(market_data)
+
+    # 2. 新闻
+    news = NewsCollector(cfg["rss_feeds"], cfg["report"]["max_news"])
+    news_data = news.collect()
+    news_text = news.format_for_ai(news_data)
+
+    # 3. Reddit 热点
+    social = SocialCollector(cfg["reddit_subs"], cfg["report"]["max_reddit_posts"])
+    social_data = social.collect()
+    social_text = social.format_for_ai(social_data)
+
+    # 4. AI 汇总
+    ai = AIAnalyzer(
+        cfg["deepseek"]["api_key"],
+        cfg["deepseek"]["model"],
+        cfg["deepseek"]["base_url"],
+    )
+    report_html = ai.generate_report(market_text, news_text, social_text)
+
+    # 5. 发邮件
+    date_str = now.strftime("%Y年%m月%d日")
+    sender = EmailSender(
+        cfg["email"]["smtp_server"],
+        cfg["email"]["smtp_port"],
+        cfg["email"]["sender"],
+        cfg["email"]["password"],
+        cfg["email"]["receivers"],
+    )
+    sender.send(f"📊 币圈日报 - {date_str}", report_html)
+
+    logger.info(f"\n✅ 全部完成！耗时 {time.time() - start:.1f} 秒")
+    logger.info("=" * 55)
+
+
+if __name__ == "__main__":
+    main()
