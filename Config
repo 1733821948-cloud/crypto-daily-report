@@ -1,0 +1,68 @@
+# ============================================================
+#  币圈日报 - 配置文件 (极简版，只需 DeepSeek + QQ邮箱)
+# ============================================================
+
+# ---------- DeepSeek API ----------
+# 获取地址: https://platform.deepseek.com/
+deepseek:
+  api_key: "sk-在这里填你的deepseek-api-key"
+  model: "deepseek-reasoner"
+  base_url: "https://api.deepseek.com"
+
+# ---------- QQ 邮箱 SMTP ----------
+# 授权码获取步骤:
+#   1. 登录 QQ 邮箱网页版 (mail.qq.com)
+#   2. 设置 → 账户 → POP3/SMTP服务 → 开启
+#   3. 按提示发短信获取授权码
+email:
+  smtp_server: "smtp.qq.com"
+  smtp_port: 465
+  sender: "在这里填你的QQ邮箱@qq.com"
+  password: "在这里填你的授权码"
+  receivers:
+    - "在这里填你的QQ邮箱@qq.com"
+
+# ---------- 追踪的加密货币（CoinGecko ID）----------
+tracking:
+  coins:
+    - bitcoin
+    - ethereum
+    - solana
+    - binancecoin
+    - ripple
+    - cardano
+    - dogecoin
+    - tron
+    - avalanche-2
+    - chainlink
+    - polkadot
+    - litecoin
+    - near
+    - uniswap
+    - sui
+  top_n: 5
+
+# ---------- Reddit 追踪的子版块 ----------
+reddit_subs:
+  - CryptoCurrency
+  - Bitcoin
+  - ethereum
+  - solana
+  - defi
+
+# ---------- RSS 新闻源（全部免费）----------
+rss_feeds:
+  - name: "CoinTelegraph"
+    url: "https://cointelegraph.com/rss"
+  - name: "Decrypt"
+    url: "https://decrypt.co/feed"
+  - name: "CoinDesk"
+    url: "https://www.coindesk.com/arc/outboundfeeds/rss/"
+  - name: "Bitcoin Magazine"
+    url: "https://bitcoinmagazine.com/feed"
+
+# ---------- 报告设置 ----------
+report:
+  timezone: "Asia/Shanghai"
+  max_news: 20
+  max_reddit_posts: 12
